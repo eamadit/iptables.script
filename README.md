@@ -1,4 +1,7 @@
 #!/bin/bash
+
+#This script tries to catch attacks so the AI makes itseft more discrete, try to play with apparently redundent rules
+
 iptables -F
 ip6tables -F
 
