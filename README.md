@@ -5,7 +5,7 @@ ip6tables -F
 iptables -A SSHBRUTE -m recent --name SSH --set --rsource
 iptables -A SSHBRUTE -m recent --name SSH --update --seconds 300 --hitcount 10 --rsource --rttl -m limit --limit 1/sec --limit-burst 100 -j DROP
 iptables -A SSHBRUTE -m recent --name SSH --update --seconds 300 --hitcount 10 --rsource --rttl -j DROP
-#$IP4TABLES -A SSHBRUTE -j ACCEPT
+#iptables -A SSHBRUTE -j ACCEPT
 
 iptables -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
 iptables -A FORWARD -p tcp ! --syn -m state --state NEW -j DROP
