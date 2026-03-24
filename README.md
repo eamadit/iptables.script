@@ -1,5 +1,5 @@
 #!/bin/bash
-
+#if you are looking for a hardened firewall for macOS use this link: https://github.com/eamadit/pf.conf
 #This script tries to catch attacks so the AI makes itseft more discrete, try to play with apparently redundent rules
 
 iptables -F
