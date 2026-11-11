@@ -1,0 +1,121 @@
+#!/bin/bash
+set -euo pipefail
+
+# ==============================================================================
+# 0. AUTO-CREATE ALLOWLIST GROUPS
+# ==============================================================================
+WEB_GROUP="allow-web"
+MAIL_GROUP="allow-mail"
+NET_GROUP="allow-net"
+
+getent group "$WEB_GROUP" >/dev/null || groupadd "$WEB_GROUP"
+getent group "$MAIL_GROUP" >/dev/null || groupadd "$MAIL_GROUP"
+getent group "$NET_GROUP" >/dev/null || groupadd "$NET_GROUP"
+
+# ==============================================================================
+# 1. KERNEL HARDENING (sysctl)
+# ==============================================================================
+# Block IP spoofing, ICMP redirects & source routing
+sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null
+sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null
+sysctl -w net.ipv4.conf.all.accept_redirects=0 >/dev/null
+sysctl -w net.ipv4.conf.default.accept_redirects=0 >/dev/null
+sysctl -w net.ipv4.conf.all.secure_redirects=0 >/dev/null
+sysctl -w net.ipv4.conf.all.send_redirects=0 >/dev/null
+sysctl -w net.ipv4.conf.all.accept_source_route=0 >/dev/null
+
+# Ignore all incoming pings & bogus ICMP errors
+sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null
+sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null
+sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=1 >/dev/null
+
+# TCP flood & session hardening
+sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null
+sysctl -w net.ipv4.tcp_rfc1337=1 >/dev/null
+
+# Disable IP forwarding & completely kill IPv6 at the kernel level
+sysctl -w net.ipv4.ip_forward=0 >/dev/null
+sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null
+
+# Kernel memory & sandbox-escape protections
+sysctl -w kernel.kptr_restrict=2 >/dev/null
+sysctl -w kernel.dmesg_restrict=1 >/dev/null
+sysctl -w net.core.bpf_jit_harden=2 >/dev/null
+sysctl -w kernel.unprivileged_userns_clone=0 >/dev/null 2>&1 || true
+
+# ==============================================================================
+# 2. DEFAULT-DENY POLICIES FIRST (Zero reload race condition)
+# ==============================================================================
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
+ip6tables -P INPUT DROP
+ip6tables -P FORWARD DROP
+ip6tables -P OUTPUT DROP
+
+# ==============================================================================
+# 3. FLUSH ALL TABLES & CUSTOM CHAINS
+# ==============================================================================
+for table in filter nat mangle raw security; do
+    iptables -t "$table" -F
+    iptables -t "$table" -X
+done
+
+ip6tables -F
+ip6tables -X
+
+# ==============================================================================
+# 4. INPUT CHAIN (Strict Anti-Spoofing & Stateful Filtering)
+# ==============================================================================
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT ! -i lo -s 127.0.0.0/8 -j DROP
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A INPUT -m limit --limit 3/min --limit-burst 5 -j LOG --log-prefix "[FW-IN-DROP] " --log-level 4
+
+# ==============================================================================
+# 5. OUTPUT CHAIN (Default-Deny App Allowlist)
+# ==============================================================================
+# Allow internal loopback
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Drop invalid outbound packets
+iptables -A OUTPUT -m conntrack --ctstate INVALID -j DROP
+
+# Allow established connections
+iptables -A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Allow DHCP lease renewals
+iptables -A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT
+
+# Allow DNS (UDP + TCP 53)
+iptables -A OUTPUT -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow NTP Time Sync (root only - keeps HTTPS/TLS certificates valid)
+iptables -A OUTPUT -p udp --dport 123 -m owner --uid-owner root -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow HTTP (80) ONLY for processes launched inside "allow-web"
+iptables -A OUTPUT -p tcp --dport 80 -m owner --gid-owner "$WEB_GROUP" -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow HTTPS (443) ONLY for processes launched inside "allow-web"
+iptables -A OUTPUT -p tcp --dport 443 -m owner --gid-owner "$WEB_GROUP" -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow Email (993 / 587) ONLY for processes launched inside "allow-mail"
+iptables -A OUTPUT -p tcp --dport 993 -m owner --gid-owner "$MAIL_GROUP" -m conntrack --ctstate NEW -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 587 -m owner --gid-owner "$MAIL_GROUP" -m conntrack --ctstate NEW -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 443 -m owner --gid-owner "$MAIL_GROUP" -m conntrack --ctstate NEW -j ACCEPT
+
+# Allow ALL outbound protocols (ICMP, HTTP/S, SSH, UDP, etc.) for "allow-net"
+iptables -A OUTPUT -m owner --gid-owner "$NET_GROUP" -j ACCEPT
+
+# Rate-limited logging of blocked outbound traffic
+iptables -A OUTPUT -m limit --limit 5/min --limit-burst 10 -j LOG --log-prefix "[FW-OUT-DROP] " --log-level 4
+
+# ==============================================================================
+# 6. VERIFY ACTIVE RULES
+# ==============================================================================
+iptables -L -v -n --line-numbers
